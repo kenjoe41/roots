@@ -22,6 +22,7 @@ import (
 	"github.com/kenjoe41/roots/internal/cert"
 	"github.com/kenjoe41/roots/internal/certscan"
 	"github.com/kenjoe41/roots/internal/loglist"
+	"github.com/kenjoe41/roots/internal/proxypool"
 	"github.com/kenjoe41/roots/internal/shardprobe"
 )
 
@@ -36,13 +37,17 @@ const (
 
 	batchSize  = 1000
 	startIndex = int64(0)
-	numWorkers = 10
 
 	httpRetryMax     = 8
 	httpRetryWaitMin = 1 * time.Second
 	httpRetryWaitMax = 60 * time.Second
 
 	probeClientTimeout = 5 * time.Second
+
+	// proxyHarvestTimeout bounds how long startup waits for the proxy
+	// harvest before giving up and crawling direct — a slow/unreachable
+	// proxy-list source must never indefinitely delay the actual crawl.
+	proxyHarvestTimeout = 60 * time.Second
 )
 
 // junkLogSubstrings marks known non-production or placeholder log entries
@@ -68,13 +73,20 @@ func isJunkLog(logURL string) bool {
 // (log list fetch, GetSTH, GetRawEntries). CT log servers rate-limit
 // aggressively under load; this transparently retries on 429/5xx and
 // connection errors, honoring a server's Retry-After header on 429 instead
-// of hammering it on a fixed interval.
-func newHTTPClient() *http.Client {
+// of hammering it on a fixed interval. If rt is non-nil (the -proxies
+// harvest produced a live pool), every request is additionally distributed
+// across the proxy pool at the transport level - retryablehttp's own retry
+// loop and this rotation compose cleanly, since a retried request just goes
+// out through RoundTrip again and gets its own independent proxy pick.
+func newHTTPClient(rt http.RoundTripper) *http.Client {
 	rc := retryablehttp.NewClient()
 	rc.RetryMax = httpRetryMax
 	rc.RetryWaitMin = httpRetryWaitMin
 	rc.RetryWaitMax = httpRetryWaitMax
 	rc.Logger = retryLogger{}
+	if rt != nil {
+		rc.HTTPClient.Transport = rt
+	}
 	return rc.StandardClient()
 }
 
@@ -104,7 +116,31 @@ func main() {
 	jsonlPath := flag.String("jsonl", "", "optional path to append one JSON record per certificate "+
 		"(log, index, hostnames, organization) to, for downstream correlation (e.g. SAN co-occurrence "+
 		"analysis). Off by default; stdout's plain hostname-per-line output is unaffected either way.")
+	workersPerLog := flag.Int("workers", 20, "concurrent range-fetch workers per log server. Higher "+
+		"values only help once -proxies gives those workers distinct source IPs to spread across - "+
+		"more workers sharing one IP just means more of them backing off together under the same "+
+		"rate limit.")
+	useProxies := flag.Bool("proxies", true, "harvest free public proxies at startup and round-robin "+
+		"every request across whatever validates as live, so a multi-billion-entry historical log "+
+		"catch-up isn't bottlenecked by one client IP's rate limit. Falls back to a direct connection "+
+		"automatically if no proxies validate (no internet access to the proxy-list sources, all dead, "+
+		"etc) - never blocks the crawl on this.")
 	flag.Parse()
+
+	var pool *proxypool.Pool
+	var proxyHarvestDone chan struct{}
+	if *useProxies {
+		pool = proxypool.New()
+		proxyHarvestDone = make(chan struct{})
+		go func() {
+			defer close(proxyHarvestDone)
+			ctx, cancel := context.WithTimeout(context.Background(), proxyHarvestTimeout)
+			defer cancel()
+			fmt.Fprintln(os.Stderr, "Harvesting free proxies...")
+			n := pool.Harvest(ctx, nil, "")
+			fmt.Fprintf(os.Stderr, "Harvested %d live proxies\n", n)
+		}()
+	}
 
 	var jsonlChan chan certscan.Record
 	var jsonlWG sync.WaitGroup
@@ -133,7 +169,11 @@ func main() {
 
 	fmt.Fprintln(os.Stderr, "Getting CT Logs list...")
 
-	httpClient := newHTTPClient()
+	var transport http.RoundTripper
+	if pool != nil {
+		transport = proxypool.NewRotatingTransport(pool)
+	}
+	httpClient := newHTTPClient(transport)
 
 	serverLogList, err := loglist.Fetch(logListURL, httpClient)
 	if err != nil {
@@ -180,12 +220,17 @@ func main() {
 		}
 	}()
 
+	if proxyHarvestDone != nil {
+		<-proxyHarvestDone // bounded by proxyHarvestTimeout above - never blocks the crawl indefinitely
+		pool.PrintStats()
+	}
+
 	var logsWG sync.WaitGroup
 	for _, logURL := range logURLs {
 		logsWG.Add(1)
 		go func(logserverURL string) {
 			defer logsWG.Done()
-			if err := processLog(logserverURL, domainsChan, jsonlChan, httpClient); err != nil {
+			if err := processLog(logserverURL, domainsChan, jsonlChan, httpClient, *workersPerLog); err != nil {
 				fmt.Fprintf(os.Stderr, "[%s] processing failed: %s\n", logserverURL, err)
 			}
 		}(logURL)
@@ -202,7 +247,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Done walking the CT Logs Tree. Found %d domains.\n", domainsCount)
 }
 
-func processLog(logserverURL string, domainsChan chan<- string, jsonlChan chan<- certscan.Record, httpClient *http.Client) error {
+func processLog(logserverURL string, domainsChan chan<- string, jsonlChan chan<- certscan.Record, httpClient *http.Client, workersPerLog int) error {
 	ctClient, err := client.New(logserverURL, httpClient, jsonclient.Options{})
 	if err != nil {
 		return fmt.Errorf("unable to construct CT log client: %w", err)
@@ -215,7 +260,7 @@ func processLog(logserverURL string, domainsChan chan<- string, jsonlChan chan<-
 	}
 
 	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
+	for w := 0; w < workersPerLog; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

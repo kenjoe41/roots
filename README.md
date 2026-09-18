@@ -49,14 +49,28 @@ tooling such as [goSubsWordlist](https://github.com/kenjoe41/goSubsWordlist).
   logs use unrelated names) — those are only reachable because `all_logs_list.json` records
   them explicitly.
 - Spawns one goroutine per log server (published + discovered).
-- Each log server is walked in `1000`-entry batches by `10` concurrent workers, with
-  exponential backoff on transient fetch errors.
+- Each log server is walked in `1000`-entry batches by `-workers` (default `20`) concurrent
+  workers, with exponential backoff on transient fetch errors.
 - All HTTP requests (log list, `GetSTH`, `GetRawEntries`) go through a shared
   [retryablehttp](https://github.com/hashicorp/go-retryablehttp) client that retries on `429`
   and `5xx` automatically, honoring a log server's `Retry-After` header on `429` instead of
   guessing a backoff — CT log servers rate-limit aggressively, and this is what lets a run
   survive that instead of silently dropping a whole log server on the first `429`. Retries are
   logged to stderr as `[http retry] ...` so you can see when a log is throttling you.
+- **`-proxies` (default on)**: at startup, harvests free public proxies from ten real,
+  regularly-updated feeds, validates each one with a real CONNECT-tunnel check, and — for every
+  request roots makes from then on — round-robins across whatever validated as live. This is
+  the actual fix for a real, live-hit problem: some log families (`argon2025h1/h2`,
+  `xenon2025h1/h2`, `nimbus2025`, ...) are historical shards discovered via the shard-prober
+  above, so they never get `roots-seed`'s "start from now" treatment and genuinely need a full
+  multi-billion-entry walk from index 0 — and a single client IP hitting a log server that hard
+  gets rate-limited into a crawl that barely moves for days. Spreading requests across many
+  source IPs is a real, direct answer to that, not a cosmetic speedup. Each proxy's reliability
+  is tracked with an EWMA health score; a proxy that starts failing gets excluded from
+  selection (never hard-removed — a transient blip can still recover) rather than dragging every
+  worker's throughput down with it. Harvesting nothing (no internet access to the proxy-list
+  sources, every candidate dead) falls back to a direct connection automatically — this flag
+  never blocks or breaks a run, it only ever helps when proxies are actually available.
 - Every valid hostname found (validated against RFC 6125 syntax rules) is printed to stdout,
   one per line, as soon as it's parsed — no buffering or deduplication.
 - Progress and errors are written to stderr, so stdout stays a clean, pipeable domain list:
@@ -87,6 +101,7 @@ Go toolchain refuses to let other modules import.
 | `internal/shardprobe` | Discovering live historical shards not present in the published log list. |
 | `internal/certscan`   | Parsing CT log entries (both entry types) into certificates, and extracting every hostname-bearing field from one. |
 | `internal/cert`       | Per-log-server resume-state persistence under `~/certwatch/logs/`.  |
+| `internal/proxypool`  | Free-proxy harvesting/validation + health-weighted round-robin selection, used when `-proxies` is on. Adapted from a sibling project's evasion-proxy package — see the package's own doc comment for exactly what carried over and what didn't. |
 
 ## Resume support
 
@@ -107,10 +122,15 @@ go install -v github.com/kenjoe41/roots@latest
 
 ```shell
 roots > domains.txt
+
+# tune concurrency and disable the proxy harvest explicitly if needed
+roots -workers 40 > domains.txt
+roots -proxies=false > domains.txt
 ```
 
-There are no flags. roots always walks every log in the current CT log list; interrupt it
-with Ctrl-C at any point — progress up to the last completed batch per log is saved.
+roots always walks every log in the current CT log list; interrupt it with Ctrl-C at any
+point — progress up to the last completed batch per log is saved. See `-h` for the full flag
+list (`-workers`, `-proxies`, `-jsonl`).
 
 ## Caveats
 
@@ -120,6 +140,11 @@ with Ctrl-C at any point — progress up to the last completed batch per log is 
 - No deduplication is performed. The same hostname will appear multiple times if it shows up
   in multiple certificates (SAN reissues, multiple logs, etc.) — dedupe downstream if needed,
   e.g. `./roots | sort -u`.
+- Free public proxies (used when `-proxies` is on, the default) are untrusted middlemen by
+  nature — everything roots fetches through them is public CT log data anyway (no
+  credentials/secrets ever cross that hop), but a malicious proxy could in principle tamper
+  with a response before it reaches roots. If that matters for your use case, run with
+  `-proxies=false`.
 
 ## License
 
