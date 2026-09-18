@@ -222,7 +222,27 @@ func main() {
 
 	if proxyHarvestDone != nil {
 		<-proxyHarvestDone // bounded by proxyHarvestTimeout above - never blocks the crawl indefinitely
-		pool.PrintStats()
+		fmt.Fprintf(os.Stderr, "Proxy pool ready: %d proxies\n", pool.Len())
+
+		// A run against multi-billion-entry logs can take days - printing
+		// health stats only once (right after harvest, before any request
+		// has used a proxy yet, or only at the very end, once it's too late
+		// to act on) is useless for an operator watching a long crawl live.
+		// Periodic stats while it runs are what's actually needed.
+		statsCtx, stopStats := context.WithCancel(context.Background())
+		defer stopStats()
+		go func() {
+			ticker := time.NewTicker(2 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-statsCtx.Done():
+					return
+				case <-ticker.C:
+					pool.PrintStats()
+				}
+			}
+		}()
 	}
 
 	var logsWG sync.WaitGroup
