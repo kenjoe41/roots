@@ -48,6 +48,12 @@ const (
 	// harvest before giving up and crawling direct — a slow/unreachable
 	// proxy-list source must never indefinitely delay the actual crawl.
 	proxyHarvestTimeout = 60 * time.Second
+
+	// proxyRefreshInterval is how often the running pool re-harvests for
+	// newly-live proxies and prunes ones with a long enough dead streak to
+	// call actually dead — see the maintenance goroutine in main() for why
+	// a startup-only harvest isn't enough for a multi-day crawl.
+	proxyRefreshInterval = 30 * time.Minute
 )
 
 // junkLogSubstrings marks known non-production or placeholder log entries
@@ -229,17 +235,41 @@ func main() {
 		// has used a proxy yet, or only at the very end, once it's too late
 		// to act on) is useless for an operator watching a long crawl live.
 		// Periodic stats while it runs are what's actually needed.
-		statsCtx, stopStats := context.WithCancel(context.Background())
-		defer stopStats()
+		maintCtx, stopMaint := context.WithCancel(context.Background())
+		defer stopMaint()
 		go func() {
-			ticker := time.NewTicker(2 * time.Minute)
+			statsTicker := time.NewTicker(2 * time.Minute)
+			defer statsTicker.Stop()
+			for {
+				select {
+				case <-maintCtx.Done():
+					return
+				case <-statsTicker.C:
+					pool.PrintStats()
+				}
+			}
+		}()
+
+		// Free proxies churn within hours (a startup-only harvest would be
+		// significantly depleted by hour 12 of a multi-day crawl), so the
+		// pool needs real top-ups, not just soft-excluding dead entries from
+		// selection forever. Refresh merges in newly-live proxies; Prune
+		// forgets ones that have failed consistently enough to be
+		// considered actually dead, not just flaky.
+		go func() {
+			ticker := time.NewTicker(proxyRefreshInterval)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-statsCtx.Done():
+				case <-maintCtx.Done():
 					return
 				case <-ticker.C:
-					pool.PrintStats()
+					refreshCtx, cancel := context.WithTimeout(maintCtx, proxyHarvestTimeout)
+					added := pool.Refresh(refreshCtx, nil, "")
+					cancel()
+					removed := pool.Prune()
+					fmt.Fprintf(os.Stderr, "[proxypool] refresh: +%d new, -%d pruned (dead streak), %d total\n",
+						added, removed, pool.Len())
 				}
 			}
 		}()

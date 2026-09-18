@@ -1,7 +1,6 @@
 package proxypool
 
 import (
-	"crypto/tls"
 	"net"
 	"net/http"
 	"net/url"
@@ -76,11 +75,28 @@ func (t *RotatingTransport) transportFor(proxyAddr string) http.RoundTripper {
 		return t.direct
 	}
 
+	// TLSClientConfig is deliberately left at its default (nil = real system
+	// CA verification, real hostname checking). For a CONNECT-tunneled HTTPS
+	// request through an http:// proxy, this transport's TLS config governs
+	// the handshake with the REAL destination (e.g. ct.googleapis.com), not
+	// some separate "proxy TLS" layer — the proxy only ever sees opaque
+	// tunneled bytes after the CONNECT. Skipping verification here (an
+	// earlier version of this code did, copied from harvest.go's own
+	// validate() without checking whether the same reasoning actually
+	// applied) would mean a malicious or compromised free proxy could MITM
+	// the tunnel and hand back forged CT log data with nothing to catch it —
+	// roots' own CT client is constructed with an empty jsonclient.Options{}
+	// in main.go, so it doesn't verify the log's STH signature either; real
+	// TLS is the only integrity check left in the whole pipeline once a
+	// request goes through a proxy. validate()'s own InsecureSkipVerify is
+	// fine specifically because it only ever probes a fixed, known
+	// connectivity-check URL to decide if a proxy is usable at all — it
+	// never trusts that response's content for anything, unlike every
+	// request this transport carries.
 	rt := &http.Transport{
 		Proxy:               http.ProxyURL(proxyURL),
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // the proxy hop is untrusted by design; the actual CT log response is still verified over its own real TLS session end-to-end through the CONNECT tunnel
 		MaxIdleConnsPerHost: 4,
 	}
 	t.perAddr[proxyAddr] = rt

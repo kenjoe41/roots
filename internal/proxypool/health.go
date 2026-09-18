@@ -15,11 +15,12 @@ const ewmaAlpha = 0.3
 
 // proxyHealth tracks one proxy's rolling success/failure record.
 type proxyHealth struct {
-	mu           sync.RWMutex
-	score        float64
-	successCount int64
-	failureCount int64
-	lastChecked  time.Time
+	mu                  sync.RWMutex
+	score               float64
+	successCount        int64
+	failureCount        int64
+	consecutiveFailures int64 // reset to 0 on any success; drives Pool.Prune, distinct from score
+	lastChecked         time.Time
 }
 
 func newProxyHealth() *proxyHealth {
@@ -31,6 +32,7 @@ func (h *proxyHealth) recordSuccess() {
 	defer h.mu.Unlock()
 	h.score = ewmaAlpha*1.0 + (1-ewmaAlpha)*h.score
 	h.successCount++
+	h.consecutiveFailures = 0
 	h.lastChecked = time.Now()
 }
 
@@ -39,6 +41,7 @@ func (h *proxyHealth) recordFailure() {
 	defer h.mu.Unlock()
 	h.score = (1 - ewmaAlpha) * h.score
 	h.failureCount++
+	h.consecutiveFailures++
 	h.lastChecked = time.Now()
 }
 
@@ -46,6 +49,12 @@ func (h *proxyHealth) getScore() float64 {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.score
+}
+
+func (h *proxyHealth) getConsecutiveFailures() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.consecutiveFailures
 }
 
 func (h *proxyHealth) counts() (success, failure int64) {
@@ -95,6 +104,16 @@ func (t *healthTracker) scoreOf(addr string) float64 {
 		return h.getScore()
 	}
 	return 0.5
+}
+
+// consecutiveFailures returns how many times in a row addr has failed with
+// no success in between, or 0 if addr has no recorded observations yet
+// (never seen is not the same as "just failed").
+func (t *healthTracker) consecutiveFailures(addr string) int64 {
+	if h := t.get(addr); h != nil {
+		return h.getConsecutiveFailures()
+	}
+	return 0
 }
 
 // poolStats summarises the health tracker for operator-facing progress

@@ -66,11 +66,18 @@ tooling such as [goSubsWordlist](https://github.com/kenjoe41/goSubsWordlist).
   multi-billion-entry walk from index 0 — and a single client IP hitting a log server that hard
   gets rate-limited into a crawl that barely moves for days. Spreading requests across many
   source IPs is a real, direct answer to that, not a cosmetic speedup. Each proxy's reliability
-  is tracked with an EWMA health score; a proxy that starts failing gets excluded from
-  selection (never hard-removed — a transient blip can still recover) rather than dragging every
-  worker's throughput down with it. Harvesting nothing (no internet access to the proxy-list
-  sources, every candidate dead) falls back to a direct connection automatically — this flag
-  never blocks or breaks a run, it only ever helps when proxies are actually available.
+  is tracked with an EWMA health score; a proxy that starts failing is first excluded from
+  selection (a transient blip can still recover it) and, only after a long enough run of
+  consecutive failures with no success in between, pruned from the pool outright. When a request
+  through a proxy fails, `retryablehttp` retries it — and because a fresh proxy is picked on
+  every attempt, the retry goes out through a *different* proxy automatically. Because free
+  proxies churn within hours, the pool also re-harvests every 30 minutes and merges in
+  newly-live proxies (dead ones already pruned), so a multi-day crawl doesn't slowly starve down
+  to whatever happened to be alive at startup. Harvesting nothing (no internet access to the
+  proxy-list sources, every candidate dead) falls back to a direct connection automatically —
+  this flag never blocks or breaks a run, it only ever helps when proxies are actually available.
+  Proxy health is logged to stderr as `[proxypool] ...` every couple of minutes so you can watch
+  the pool's size and quality over a long run.
 - Every valid hostname found (validated against RFC 6125 syntax rules) is printed to stdout,
   one per line, as soon as it's parsed — no buffering or deduplication.
 - Progress and errors are written to stderr, so stdout stays a clean, pipeable domain list:
@@ -141,10 +148,12 @@ list (`-workers`, `-proxies`, `-jsonl`).
   in multiple certificates (SAN reissues, multiple logs, etc.) — dedupe downstream if needed,
   e.g. `./roots | sort -u`.
 - Free public proxies (used when `-proxies` is on, the default) are untrusted middlemen by
-  nature — everything roots fetches through them is public CT log data anyway (no
-  credentials/secrets ever cross that hop), but a malicious proxy could in principle tamper
-  with a response before it reaches roots. If that matters for your use case, run with
-  `-proxies=false`.
+  nature. roots does **not** disable TLS verification for proxied requests — the CONNECT tunnel
+  still performs a real, verified TLS handshake end-to-end with the actual log server
+  (`ct.googleapis.com`, etc.), so a proxy sees only opaque encrypted bytes and can't silently
+  substitute forged CT data. Everything fetched is public CT log data anyway; no
+  credentials/secrets ever cross that hop. If you'd still rather not route through third-party
+  proxies at all, run with `-proxies=false`.
 
 ## License
 

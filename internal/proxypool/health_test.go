@@ -91,3 +91,28 @@ func TestProxyHealth_CountsTrackObservations(t *testing.T) {
 		t.Errorf("counts() = (%d, %d), want (2, 1)", success, failure)
 	}
 }
+
+func TestProxyHealth_ConsecutiveFailuresResetOnSuccess(t *testing.T) {
+	h := newProxyHealth()
+	h.recordFailure()
+	h.recordFailure()
+	h.recordFailure()
+	if got := h.getConsecutiveFailures(); got != 3 {
+		t.Fatalf("consecutiveFailures = %d, want 3", got)
+	}
+	h.recordSuccess()
+	if got := h.getConsecutiveFailures(); got != 0 {
+		t.Errorf("consecutiveFailures after a success = %d, want 0 (streak must reset)", got)
+	}
+	h.recordFailure()
+	if got := h.getConsecutiveFailures(); got != 1 {
+		t.Errorf("consecutiveFailures = %d, want 1 (streak restarts from the post-success failure)", got)
+	}
+}
+
+func TestHealthTracker_ConsecutiveFailuresUnknownIsZero(t *testing.T) {
+	ht := newHealthTracker()
+	if got := ht.consecutiveFailures("http://never-seen:80"); got != 0 {
+		t.Errorf("consecutiveFailures(unknown) = %d, want 0", got)
+	}
+}

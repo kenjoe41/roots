@@ -14,6 +14,16 @@ import (
 // heavy crawl doesn't necessarily mean a proxy is actually dead.
 const minHealthScore = 0.2
 
+// deadStreakThreshold is how many consecutive failures (no success since)
+// mark a proxy as truly dead rather than just flaky, driving Prune's actual
+// removal from the pool — distinct from minHealthScore, which only ever
+// excludes a proxy from selection while keeping it around in case it
+// recovers. A free proxy that has failed this many times in a row in
+// practice never comes back; without ever forgetting these, a multi-day
+// crawl's pool only grows, all-uphill, an ever-larger fraction of it dead
+// weight Next() has to skip over on every single call.
+const deadStreakThreshold = 20
+
 // Pool distributes requests across a set of validated proxies. Unlike
 // shadowweave's Rotator (its own closest analogue — see harvest.go's package
 // doc for the full reasoning on what didn't carry over), Pool deliberately
@@ -97,6 +107,60 @@ func (p *Pool) Report(proxyAddr string, ok bool) {
 	} else {
 		p.health.recordFailure(proxyAddr)
 	}
+}
+
+// Refresh harvests again and merges newly-found live proxies into the
+// existing pool (deduplicated against what's already there) — unlike
+// Harvest, it never replaces or removes anything, so a proxy that's merely
+// degraded (but hasn't hit Prune's dead-streak threshold) stays exactly
+// where it was. Meant to be called periodically during a long crawl: free
+// proxies churn within hours, so a pool populated once at startup of a
+// run that can take days needs real top-ups, not just one harvest.
+// Returns how many genuinely new proxies were added.
+func (p *Pool) Refresh(ctx context.Context, sources []string, validatorURL string) int {
+	if len(sources) == 0 {
+		sources = defaultSources
+	}
+	if validatorURL == "" {
+		validatorURL = defaultValidatorURL
+	}
+	fresh := harvest(ctx, sources, validatorURL)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	existing := make(map[string]struct{}, len(p.proxies))
+	for _, addr := range p.proxies {
+		existing[addr] = struct{}{}
+	}
+	added := 0
+	for _, addr := range fresh {
+		if _, ok := existing[addr]; !ok {
+			p.proxies = append(p.proxies, addr)
+			existing[addr] = struct{}{}
+			added++
+		}
+	}
+	return added
+}
+
+// Prune removes every proxy at or beyond deadStreakThreshold consecutive
+// failures from the pool outright — the actual forgetting Next's
+// minHealthScore floor deliberately never does on its own. Returns how many
+// were removed.
+func (p *Pool) Prune() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := make([]string, 0, len(p.proxies))
+	removed := 0
+	for _, addr := range p.proxies {
+		if p.health.consecutiveFailures(addr) >= deadStreakThreshold {
+			removed++
+			continue
+		}
+		kept = append(kept, addr)
+	}
+	p.proxies = kept
+	return removed
 }
 
 // Len returns the number of proxies currently in the pool, healthy or not.
