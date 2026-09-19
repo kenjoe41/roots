@@ -78,6 +78,16 @@ tooling such as [goSubsWordlist](https://github.com/kenjoe41/goSubsWordlist).
   this flag never blocks or breaks a run, it only ever helps when proxies are actually available.
   Proxy health is logged to stderr as `[proxypool] ...` every couple of minutes so you can watch
   the pool's size and quality over a long run.
+- **`-max-conns` (default `60`)**: a global cap on how many connections roots holds open at once,
+  across everything it does — the crawl, the proxy-harvest validation probes, and the shard prober
+  combined. This matters: `-workers` × (number of logs) can otherwise be ~940 simultaneous
+  connections, each (with `-proxies` on) dialing a different proxy, which is enough to exhaust a
+  home router's NAT/conntrack table and freeze the **entire** network, not just roots (a real,
+  hit-in-practice incident). The cap is enforced at the dial level — every TCP connection acquires
+  a slot before it's opened and frees it only when closed — so idle keep-alives, in-progress dials
+  to dead proxies, and harvest probes all count against the one budget. The default is deliberately
+  conservative because the network is usually shared with other processes (a browser, a torrent
+  client); raise it if roots has the network mostly to itself and you want more throughput.
 - Every valid hostname found (validated against RFC 6125 syntax rules) is printed to stdout,
   one per line, as soon as it's parsed — no buffering or deduplication.
 - Progress and errors are written to stderr, so stdout stays a clean, pipeable domain list:
@@ -133,6 +143,11 @@ roots > domains.txt
 # tune concurrency and disable the proxy harvest explicitly if needed
 roots -workers 40 > domains.txt
 roots -proxies=false > domains.txt
+
+# raise the global connection cap when roots has the network to itself,
+# or lower it further on a busy/shared connection
+roots -max-conns 150 > domains.txt
+roots -max-conns 30  > domains.txt
 ```
 
 roots always walks every log in the current CT log list; interrupt it with Ctrl-C at any

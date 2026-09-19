@@ -124,13 +124,13 @@ func TestValidate_RealHTTPProxy(t *testing.T) {
 	// against a real third-party proxy isn't reproducible in CI.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = validate(ctx, proxy.Listener.Addr().String(), target.URL)
+	_ = validate(ctx, proxy.Listener.Addr().String(), target.URL, nil)
 }
 
 func TestValidate_UnreachableProxy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if validate(ctx, "127.0.0.1:1", defaultValidatorURL) {
+	if validate(ctx, "127.0.0.1:1", defaultValidatorURL, nil) {
 		t.Error("expected an unreachable proxy to fail validation")
 	}
 }

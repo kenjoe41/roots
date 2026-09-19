@@ -79,20 +79,34 @@ func isJunkLog(logURL string) bool {
 // (log list fetch, GetSTH, GetRawEntries). CT log servers rate-limit
 // aggressively under load; this transparently retries on 429/5xx and
 // connection errors, honoring a server's Retry-After header on 429 instead
-// of hammering it on a fixed interval. If rt is non-nil (the -proxies
+// of hammering it on a fixed interval. If proxyRT is non-nil (the -proxies
 // harvest produced a live pool), every request is additionally distributed
 // across the proxy pool at the transport level - retryablehttp's own retry
 // loop and this rotation compose cleanly, since a retried request just goes
 // out through RoundTrip again and gets its own independent proxy pick.
-func newHTTPClient(rt http.RoundTripper) *http.Client {
+//
+// maxConns caps the number of connections roots holds open at once, globally
+// across every log worker - the single most important knob for not freezing
+// a shared home network (see proxypool.LimitedRoundTripper). The limiter is
+// the OUTERMOST transport so the cap applies whether a request goes through
+// a proxy or direct, and on every retry.
+func newHTTPClient(proxyRT http.RoundTripper, limiter *proxypool.ConnLimiter) *http.Client {
 	rc := retryablehttp.NewClient()
 	rc.RetryMax = httpRetryMax
 	rc.RetryWaitMin = httpRetryWaitMin
 	rc.RetryWaitMax = httpRetryWaitMax
 	rc.Logger = retryLogger{}
-	if rt != nil {
-		rc.HTTPClient.Transport = rt
+
+	if proxyRT != nil {
+		// The proxy-rotating transport already gates every dial (proxied and
+		// its own direct fallback) through the limiter.
+		rc.HTTPClient.Transport = proxyRT
+	} else {
+		// -proxies=false: still bound dials so a direct crawl can't flood the
+		// network either.
+		rc.HTTPClient.Transport = limiter.LimitedTransport()
 	}
+
 	return rc.StandardClient()
 }
 
@@ -131,12 +145,27 @@ func main() {
 		"catch-up isn't bottlenecked by one client IP's rate limit. Falls back to a direct connection "+
 		"automatically if no proxies validate (no internet access to the proxy-list sources, all dead, "+
 		"etc) - never blocks the crawl on this.")
+	maxConns := flag.Int("max-conns", 60, "global cap on the number of connections roots holds open "+
+		"at once, across ALL log workers combined. Without this, -workers x (num logs) can be ~940 "+
+		"simultaneous connections, enough to exhaust a home router's NAT table and freeze the whole "+
+		"network (a real, operator-hit incident). Deliberately conservative by default since the network "+
+		"is usually shared with other processes (a browser, a torrent client, other tools); raise it if "+
+		"roots has the network mostly to itself and you want more throughput. Total live connections stay "+
+		"roughly at this cap plus a small bounded idle pool.")
 	flag.Parse()
+
+	// One global connection limiter, shared by every dial roots makes — the
+	// crawl (proxied or direct), the proxy-harvest validation probes, and the
+	// shard prober — so the total live-connection count stays under -max-conns
+	// no matter which subsystem opens them. This is the knob that keeps roots
+	// from exhausting a shared home network's NAT table.
+	connLimiter := proxypool.NewConnLimiter(*maxConns)
 
 	var pool *proxypool.Pool
 	var proxyHarvestDone chan struct{}
 	if *useProxies {
 		pool = proxypool.New()
+		pool.SetLimiter(connLimiter)
 		proxyHarvestDone = make(chan struct{})
 		go func() {
 			defer close(proxyHarvestDone)
@@ -177,9 +206,9 @@ func main() {
 
 	var transport http.RoundTripper
 	if pool != nil {
-		transport = proxypool.NewRotatingTransport(pool)
+		transport = proxypool.NewRotatingTransport(pool, connLimiter)
 	}
-	httpClient := newHTTPClient(transport)
+	httpClient := newHTTPClient(transport, connLimiter)
 
 	serverLogList, err := loglist.Fetch(logListURL, httpClient)
 	if err != nil {
@@ -197,7 +226,10 @@ func main() {
 	}
 
 	fmt.Fprintln(os.Stderr, "Probing for historical log shards not in the published list...")
-	probeClient := &http.Client{Timeout: probeClientTimeout}
+	// The shard prober fans out its own concurrent HEAD probes; route them
+	// through the same limiter so they count against the global cap too.
+	probeTransport := connLimiter.LimitedTransport()
+	probeClient := &http.Client{Timeout: probeClientTimeout, Transport: probeTransport}
 	extraShards := shardprobe.Discover(context.Background(), probeClient, logURLs)
 	if len(extraShards) > 0 {
 		fmt.Fprintf(os.Stderr, "Found %d additional live historical shard(s):\n", len(extraShards))

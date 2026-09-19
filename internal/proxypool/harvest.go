@@ -76,7 +76,7 @@ var validIPPortRegex = regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d
 // printed to stderr — matching this codebase's existing "warn and keep
 // going" convention (see main.go's own per-log error handling) rather than
 // aborting the whole harvest over one dead source.
-func harvest(ctx context.Context, sources []string, validatorURL string) []string {
+func harvest(ctx context.Context, sources []string, validatorURL string, limiter *ConnLimiter) []string {
 	fetchClient := &http.Client{Timeout: fetchSourceTimeout}
 
 	candidates := make(map[string]struct{})
@@ -103,7 +103,7 @@ func harvest(ctx context.Context, sources []string, validatorURL string) []strin
 		go func() {
 			defer wg.Done()
 			for addr := range jobs {
-				results <- result{addr: addr, ok: validate(ctx, addr, validatorURL)}
+				results <- result{addr: addr, ok: validate(ctx, addr, validatorURL, limiter)}
 			}
 		}()
 	}
@@ -230,7 +230,7 @@ func parseJSONList(body []byte) []string {
 // validator endpoint approved of the request) this only cares that the
 // PROXY functioned, since the real traffic afterwards goes to CT log
 // servers with their own, different status-code semantics (429 included).
-func validate(ctx context.Context, proxyAddr, validatorURL string) bool {
+func validate(ctx context.Context, proxyAddr, validatorURL string, limiter *ConnLimiter) bool {
 	timeoutCtx, cancel := context.WithTimeout(ctx, validateTimeout)
 	defer cancel()
 
@@ -239,9 +239,12 @@ func validate(ctx context.Context, proxyAddr, validatorURL string) bool {
 		return false
 	}
 
+	// Gate the validation dial through the same global limiter as the crawl,
+	// so harvesting up to validateConcurrency proxies at once can't itself
+	// blow past the operator's connection cap.
 	transport := &http.Transport{
 		Proxy:               http.ProxyURL(proxyURL),
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		DialContext:         limiter.Wrap((&net.Dialer{Timeout: 5 * time.Second}).DialContext),
 		TLSHandshakeTimeout: 5 * time.Second,
 		DisableKeepAlives:   true,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // validating proxy reachability only, no sensitive data crosses this connection

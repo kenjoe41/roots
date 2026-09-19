@@ -38,11 +38,20 @@ type Pool struct {
 	proxies []string
 	health  *healthTracker
 	idx     uint64
+	limiter *ConnLimiter // may be nil (no dial limiting); gates harvest validation dials
 }
 
 // New returns an empty Pool. Call Harvest to populate it.
 func New() *Pool {
 	return &Pool{health: newHealthTracker()}
+}
+
+// SetLimiter attaches a global connection limiter so the pool's own harvest/
+// refresh validation probes (up to validateConcurrency simultaneous dials)
+// count against the same connection budget as the crawl — without this,
+// harvesting alone could exceed the cap the operator set.
+func (p *Pool) SetLimiter(l *ConnLimiter) {
+	p.limiter = l
 }
 
 // Harvest fetches and validates proxies from sources (defaultSources if
@@ -58,7 +67,7 @@ func (p *Pool) Harvest(ctx context.Context, sources []string, validatorURL strin
 		validatorURL = defaultValidatorURL
 	}
 
-	live := harvest(ctx, sources, validatorURL)
+	live := harvest(ctx, sources, validatorURL, p.limiter)
 
 	p.mu.Lock()
 	p.proxies = live
@@ -124,7 +133,7 @@ func (p *Pool) Refresh(ctx context.Context, sources []string, validatorURL strin
 	if validatorURL == "" {
 		validatorURL = defaultValidatorURL
 	}
-	fresh := harvest(ctx, sources, validatorURL)
+	fresh := harvest(ctx, sources, validatorURL, p.limiter)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
