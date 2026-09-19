@@ -19,13 +19,19 @@ import (
 var writeMu sync.Mutex
 
 // GetLogsDir returns the directory used to persist per-log-server resume
-// state, creating it if necessary.
+// state. Hidden under the home directory (`~/.certwatch/logs`) — resume
+// state is internal tool bookkeeping, not something a user browses, so it
+// belongs out of a plain `ls ~` listing like every other well-behaved
+// tool's state dir. NOTE: hound's own internal/ctlogseed.DefaultLogsDir
+// computes this exact same path independently in order to pre-seed roots'
+// resume state; the two MUST stay byte-identical or hound seeds the wrong
+// directory and every log silently does a full historical re-walk.
 func GetLogsDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(usr.HomeDir, "certwatch", "logs"), nil
+	return filepath.Join(usr.HomeDir, ".certwatch", "logs"), nil
 }
 
 // CheckLogsFolder ensures the logs directory returned by GetLogsDir exists.
