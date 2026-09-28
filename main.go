@@ -75,6 +75,49 @@ func isJunkLog(logURL string) bool {
 	return false
 }
 
+// filterLogURLs applies -logs-include then -logs-exclude (each a comma-separated
+// substring list; empty means "no filter for this side"). A log URL survives only
+// if it matches at least one include substring (when any are given) AND matches
+// none of the exclude substrings.
+func filterLogURLs(logURLs []string, includeCSV, excludeCSV string) []string {
+	includes := splitNonEmpty(includeCSV)
+	excludes := splitNonEmpty(excludeCSV)
+	if len(includes) == 0 && len(excludes) == 0 {
+		return logURLs
+	}
+	var out []string
+	for _, u := range logURLs {
+		if len(includes) > 0 && !containsAny(u, includes) {
+			continue
+		}
+		if len(excludes) > 0 && containsAny(u, excludes) {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+func splitNonEmpty(csv string) []string {
+	var out []string
+	for _, s := range strings.Split(csv, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func containsAny(s string, substrs []string) bool {
+	for _, sub := range substrs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // newHTTPClient returns an *http.Client shared by every request roots makes
 // (log list fetch, GetSTH, GetRawEntries). CT log servers rate-limit
 // aggressively under load; this transparently retries on 429/5xx and
@@ -152,6 +195,15 @@ func main() {
 		"is usually shared with other processes (a browser, a torrent client, other tools); raise it if "+
 		"roots has the network mostly to itself and you want more throughput. Total live connections stay "+
 		"roughly at this cap plus a small bounded idle pool.")
+	logsInclude := flag.String("logs-include", "", "comma-separated substrings; only crawl log URLs "+
+		"containing at least one of them. Lets a big multi-log crawl be split into separate invocations "+
+		"— e.g. run the logs that are nearly caught up to their tree tip at full speed first, then a "+
+		"second, throttled (-workers/-max-conns) invocation over everything else for the long historical "+
+		"backlog. Per-log resume state on disk (~/.certwatch/logs) is unaffected by which subset any given "+
+		"invocation covers, so splitting/resuming this way never loses or re-walks progress. Applied "+
+		"before -logs-exclude if both are set.")
+	logsExclude := flag.String("logs-exclude", "", "comma-separated substrings; skip any log URL "+
+		"containing one of them. See -logs-include.")
 	flag.Parse()
 
 	// One global connection limiter, shared by every dial roots makes — the
@@ -237,6 +289,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  %s\n", url)
 		}
 		logURLs = append(logURLs, extraShards...)
+	}
+
+	if *logsInclude != "" || *logsExclude != "" {
+		logURLs = filterLogURLs(logURLs, *logsInclude, *logsExclude)
+		fmt.Fprintf(os.Stderr, "Filtered to %d log(s) after -logs-include/-logs-exclude:\n", len(logURLs))
+		for _, u := range logURLs {
+			fmt.Fprintf(os.Stderr, "  %s\n", u)
+		}
 	}
 
 	// Check or create logs folder used to persist per-server resume state.
